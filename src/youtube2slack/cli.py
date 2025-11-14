@@ -3,12 +3,16 @@
 import os
 import sys
 import logging
+import time
 from pathlib import Path
 from typing import Optional, List
 import click
 
 from .workflow import YouTube2SlackWorkflow, WorkflowConfig, ProcessingResult
 from .downloader import YouTubeDownloader
+from .stream_processor import StreamProcessor
+from .whisper_transcriber import WhisperTranscriber
+from .slack_client import SlackClient
 
 
 def setup_logging(verbose: bool = False, log_file: Optional[str] = None) -> None:
@@ -324,6 +328,84 @@ def info(url: str):
             
     except Exception as e:
         click.echo(f"✗ Failed to get info: {e}", err=True)
+        sys.exit(1)
+
+
+@cli.command()
+@click.argument('stream_url')
+@click.option('--chunk-duration', '-d', default=30, help='Duration of each chunk in seconds')
+@click.option('--overlap', '-p', default=5, help='Overlap between chunks in seconds')
+@click.option('--whisper-model', '-m', default='base', help='Whisper model size')
+@click.option('--language', '-l', help='Language code (auto-detect if not specified)')
+@click.option('--slack-webhook', help='Slack webhook URL')
+@click.option('--slack-channel', help='Slack channel override')
+@click.pass_context
+def stream(ctx, stream_url: str, chunk_duration: int, overlap: int,
+          whisper_model: str, language: Optional[str],
+          slack_webhook: Optional[str], slack_channel: Optional[str]):
+    """Process a live YouTube stream in real-time chunks."""
+    
+    config: WorkflowConfig = ctx.obj['config']
+    
+    # Override config with CLI options
+    if whisper_model != 'base':
+        config.whisper_model = whisper_model
+    if language:
+        config.whisper_language = language
+    if slack_webhook:
+        config.slack_webhook = slack_webhook
+    if slack_channel:
+        config.slack_channel = slack_channel
+    
+    # Validate required configuration
+    if not config.slack_webhook:
+        click.echo("Error: Slack webhook URL is required", err=True)
+        sys.exit(1)
+    
+    # Initialize components
+    click.echo("Initializing stream processor...")
+    
+    transcriber = WhisperTranscriber(
+        model_name=config.whisper_model,
+        device=config.whisper_device,
+        download_root=config.whisper_download_root
+    )
+    
+    slack_client = SlackClient(
+        webhook_url=config.slack_webhook,
+        channel=config.slack_channel
+    )
+    
+    processor = StreamProcessor(
+        transcriber=transcriber,
+        slack_client=slack_client,
+        chunk_duration=chunk_duration,
+        overlap_duration=overlap
+    )
+    
+    def progress_callback(message: str):
+        click.echo(f"  {message}")
+    
+    try:
+        click.echo(f"🔴 Starting live stream processing...")
+        click.echo(f"⏱️  Chunk duration: {chunk_duration}s (overlap: {overlap}s)")
+        click.echo("Press Ctrl+C to stop processing")
+        
+        # Start processing
+        processor.start_stream_processing(stream_url, progress_callback)
+        
+        # Keep running until interrupted
+        try:
+            while processor.is_running:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            click.echo("\n🛑 Stopping stream processing...")
+            processor.stop_processing()
+            click.echo("✓ Stream processing stopped")
+            
+    except Exception as e:
+        click.echo(f"✗ Stream processing failed: {e}", err=True)
+        processor.stop_processing()
         sys.exit(1)
 
 
